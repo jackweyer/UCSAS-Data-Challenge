@@ -1,0 +1,143 @@
+---
+title: "uconn_EDA"
+author: "Jack Weyer"
+date: '2022-07-20'
+output: pdf_document
+---
+##Load Packages
+```{r}
+library(tidymodels)
+library(MASS)
+library(ggridges)
+```
+
+##Load Data
+```{r}
+teamInfo <- read.csv("team_info.csv")
+ballPos <- read.csv("ball_pos.csv")
+gameEvents <- read.csv("game_events.csv")
+gameInfo <- read.csv("game_info.csv")
+playerPos <- read.csv("player_pos.csv")
+```
+
+##Exploratory Data Analysis
+```{r}
+unique(teamInfo$team_id) #37 teams
+
+gameInfo %>% 
+  group_by(game_str, home_team) %>% 
+  slice(1) %>% 
+  count() %>% 
+  group_by(home_team) %>% 
+  summarise(homeGames = sum(n))
+
+gameInfo %>% 
+  group_by(game_str, away_team) %>% 
+  slice(1) %>% 
+  count() %>% 
+  group_by(away_team) %>% 
+  summarise(awayGames = sum(n))
+```
+A{1,2,3} and B are home teams and play lots of games. All other teams visit for 2-3 games.
+
+Recorded Bounces Distribution
+```{r}
+bounces <-  gameEvents %>% 
+  filter(event_code %in% c(9, 10, 16)) %>% 
+  group_by(game_str) %>% 
+  count()
+
+fit <- fitdistr(bounces$n, densfun = "normal")
+
+hist(bounces$n, prob=T, breaks=30)
+curve(dnorm(x, fit$estimate[1], fit$estimate[2]), add=T)
+```
+9 == ball deflection
+10 === deflection off wall
+16 == ball bounce
+Very inconsistent wide distribution of recorded bounces across the 97 games. Several games (all Team B) with less than 10 "bounces."
+
+```{r}
+# add team and year variables to bounce df
+bounces <- bounces %>% 
+  mutate(year = as.numeric(substr(game_str,1,4))) %>% 
+  mutate(team = ifelse(grepl("TeamB", game_str),1,0))
+```
+
+```{r}
+bounces %>% 
+  filter(team == 1) %>% #team B
+  ggplot(aes(x = n, y = factor(year), fill = factor(year))) + geom_density_ridges() +
+  theme_minimal() +
+  labs(x = "Recorded Bounces + Deflections per Game",
+       y = "",
+       title = "Team B has inconsistent bounce tracking year to year") +
+  theme(legend.position = "none") 
+  
+```
+```{r}
+bounces %>% 
+  filter(team==0) %>% #Team A organization
+ggplot(aes(x = n, y = factor(year), fill = factor(year))) + geom_density_ridges() +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(x = "Recorded Bounces + Deflections per Game",
+       y = "",
+       title="Team A games have consistent (reliable) bounce data") 
+```
+```{r}
+ballPos %>% 
+  filter(game_str == "1900_01_TeamKJ_TeamB") %>% 
+  filter(play_id == 14) %>%
+ggplot(aes(x = timestamp, y = ball_position_z)) + geom_line() +
+  geom_vline(xintercept = 367103, color = "green", lty = 2, size = 2) +
+  geom_vline(xintercept = 370800, color = "red", lty = 2, size = 2) +
+  #geom_vline(xintercept = 373704, color = "red", lty = 2, size = 2) +
+  theme_classic() +
+  labs(x = "Timestamp Duration",
+       y = "Baseball Height (feet)",
+       title = "Inconsistent Ball Tracking for Team B",
+       subtitle = "Green = time of contact | Red = time that ball acquired")
+```
+Above is a play at Team B's field where it is clear the ball bounces twice but no bounce is recorded. This presents a huge problem with big data for to figure out if a fielder caught a ball in the air or after a bounce.
+
+```{r}
+# Filter to Team A's games
+bounces <- bounces %>% 
+  filter(team==0) %>% 
+  mutate(home = substr(game_str, 20,21) %>% 
+           as.factor())
+
+bounces %>% 
+  group_by(home, year) %>% 
+  summarise(gamesPlayed=n())
+```
+Pretty consistent games played among the A organization. Limits outfield skill bias under assumption of three "levels"
+```{r}
+bounces %>% 
+  ggplot(aes(x = n, y = factor(year), color = factor(year))) + geom_boxplot() + 
+  geom_point() + 
+  facet_wrap(~home) + 
+  labs(title = "Bounce tracking appears consistent across year and level", y = "",
+       x = "Bounces per game") +
+  theme(legend.position = "none")
+```
+Is there a statistical difference?
+```{r}
+mod <- lm(data = bounces, n ~ year + home + year:home)
+summary(mod)
+```
+Neither year nor "level" make a statistical impact on predicting recorded bounces per game among A games. 
+
+```{r}
+bounces <-  gameEvents %>% 
+  filter(event_code %in% c(9, 10, 16)) %>% 
+  group_by(game_str) %>% 
+  count() %>% 
+  mutate(year = as.numeric(substr(game_str, 1, 4))) %>% 
+  mutate(team = ifelse(grepl("TeamB", game_str), 1, 0))
+
+mod2 <- lm(data = bounces, n ~ year + team + year:team)
+summary(mod2)
+```
+Team does make a statistical impact on bounces per game. We will exclude Team B games from this analysis.

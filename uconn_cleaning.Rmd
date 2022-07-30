@@ -1,0 +1,618 @@
+---
+title: "uconn_Cleaning"
+author: "Jack Weyer"
+date: '2022-07-20'
+output: pdf_document
+---
+
+#Load Packages
+```{r}
+library(tidymodels)
+library(MASS)
+library(ggridges)
+```
+
+#Load Data
+```{r}
+teamInfo <- read.csv("team_info.csv")
+ballPos <- read.csv("ball_pos.csv")
+gameEvents <- read.csv("game_events.csv")
+gameInfo <- read.csv("game_info.csv")
+playerPos <- read.csv("player_pos.csv")
+```
+
+#Filter to Team A's games
+```{r}
+#As games
+Agames <- gameInfo %>% 
+  filter(home_team %in% c("TeamA1", "TeamA2", "TeamA3")) %>% 
+  group_by(game_str) %>% 
+  slice(1) %>% 
+  pull(game_str)
+
+AsGameInfo <- gameInfo %>% 
+  filter(game_str %in% Agames)
+
+AsGameEvents <- gameEvents %>% 
+  filter(game_str %in% Agames)
+
+AsBalls <- ballPos %>% 
+  filter(game_str %in% Agames)
+
+AsPlayers <- playerPos %>% 
+  filter(game_str %in% Agames)
+
+AsGameInfo <- AsGameInfo %>% 
+  mutate(year = as.numeric(substr(game_str, 1, 4)))
+```
+
+Get game events (play_id) with a OF--2 (ball acquired), OF--7 (ball acquired unknown field position)
+
+Other important player_position--event_code
+ 1--1 (pitcher pitch)
+ 2--2 (catcher catch)
+ 10--4 (ball in play)
+ 0--5 (end of play)
+ x--3 throw
+ x--9 player ball deflection
+ 255--10 deflection off wall
+ 255--16 ball bounce
+ 
+#Filter our data to plays with outfielder "action"
+```{r}
+#plays where an outfielder is involved
+Ofplays <- AsGameEvents %>% 
+  filter(player_position %in% c(7,8,9)) %>% 
+  dplyr::select(game_str, play_id) %>% 
+  unique()
+
+AsGameEvents <- inner_join(Ofplays, AsGameEvents)
+AsBalls <- inner_join(Ofplays, AsBalls)
+AsPlayers <- inner_join(Ofplays, AsPlayers)
+```
+#Get pitch "time" for each outfielder play
+```{r}
+pitches <- AsGameEvents %>% 
+  filter(player_position == 1 & event_code == 1)
+
+pitches$pitchTime <- pitches$timestamp
+
+pitches <- pitches %>% dplyr::select(game_str, play_id, pitchTime)
+AsGameEvents <- full_join(pitches, AsGameEvents)
+```
+#Get first "event" not including pitch or hit (OF ball acquired--2 or 7, catcher catch 2--2, OF deflection x--9, ball deflection 255--10, ball bounce 255-16)
+```{r}
+AsGameEvents %>% 
+  filter(event_code != 1) %>% 
+  filter(event_code != 4) %>% # not the pitch or hit 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  group_by(event_code) %>% 
+  summarise(n = n())
+```
+First event not including pitch and/or hit..
+722 16's (Ball bounce)
+691 2's (Ball acquired.. i.e. caught)
+48 10's (deflection off wall)
+14 9's (deflection) .. filter out deflections by non outfielders
+11 5's (end of play) .. this is when end of play time = catch time
+3 6's (pickoff) .. remove these
+
+#Remove pickoffs
+```{r}
+pickoffs <- AsGameEvents %>% 
+  filter(event_code == 6) %>% 
+  dplyr::select(game_str, play_id)
+
+AsGameEvents <- anti_join(AsGameEvents, pickoffs)
+```
+#Remove first deflections by non-outfielders
+```{r}
+DeflectedByNonOF <- AsGameEvents %>% 
+  filter(event_code != 1) %>% 
+  filter(event_code != 4) %>% # not the pitch or hit 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% #first event after hit
+  filter(event_code==9) %>% #deflection
+  filter(!player_position %in% c(7,8,9)) %>% #not by an OF
+  dplyr::select(game_str, play_id)
+
+AsGameEvents <- anti_join(AsGameEvents, DeflectedByNonOF) #remove deflections by non OFs
+```
+#Remove non-batted ball plays (catcher errant throw to outfield)
+```{r}
+BattedBalls <- AsGameEvents %>% 
+  filter(event_code==4) %>% 
+  dplyr::select(game_str, play_id)
+
+AsGameEvents <- inner_join(AsGameEvents, BattedBalls)
+```
+
+#On plays where the batted ball bounces before being picked up, filter to an OF touching the ball first
+```{r}
+BouncePlays <- AsGameEvents %>% 
+  filter(event_code != 1) %>% 
+  filter(event_code != 4) %>% # not the pitch or hit 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  filter(event_code == 16) %>% #ball bounce
+  dplyr::select(game_str, play_id)
+
+bad_plays <- inner_join(BouncePlays, AsGameEvents) %>% filter(!event_code %in% c(1,4,16,10,5)) %>% 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  filter(!player_position %in% c(7,8,9)) %>% #non OFs
+  dplyr::select(game_str, play_id) # these are plays that bounced but a non-outfilder was the first to deflect or acquire
+
+AsGameEvents <- anti_join(AsGameEvents, bad_plays)
+```
+
+#Sometimes end of play is listed before a catch. Let's just remove 5's completely
+```{r}
+AsGameEvents <- AsGameEvents %>% 
+  filter(event_code!=5)
+```
+
+Who touched first after hitting wall?
+```{r}
+WallPlays <- AsGameEvents %>% 
+  filter(event_code != 1) %>% 
+  filter(event_code != 4) %>% # not the pitch or hit 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  filter(event_code==10) %>% #deflection off wall
+  dplyr::select(game_str, play_id)
+
+
+inner_join(WallPlays, AsGameEvents) %>%
+  filter(!event_code %in% c(1,4,10, 16,5)) %>% 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>%
+  filter(!player_position %in% c(7,8,9))
+  #Good! all "wall plays" were first picked up by an OF
+```
+
+Deflections need investigation.. were these all dropped?
+```{r}
+Deflections <- AsGameEvents %>% 
+  filter(event_code != 1) %>% 
+  filter(event_code != 4) %>% # not the pitch or hit 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  filter(event_code==9) %>% 
+  dplyr::select(game_str, play_id)
+
+inner_join(Deflections, AsGameEvents)
+
+#YES! checked the 10 manually. All dropped
+```
+
+The data has been properly subsetted to outfield opportunites for Team A's games.
+```{r}
+AsGameEvents %>% 
+  filter(event_code != 1) %>% 
+  filter(event_code != 4) %>% # not the pitch or hit 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  group_by(event_code) %>% 
+  summarise(n = n())
+```
+712 16's (Ball bounce.. failure)
+696 2's (Ball acquired.. success)
+48 10's (deflection off wall.. failure)
+10 9's (deflection and drop.. failure)
+
+#Get ball landing (or catching) "time" and hang time for each play
+```{r}
+hm <- AsGameEvents
+hm <- hm %>% 
+  group_by(game_str, play_id) %>% 
+  slice(3) %>% #after the pitch and ball in play events 
+  mutate(endTime = timestamp) %>% #time of first event after contact
+  mutate(airTime = endTime - pitchTime) %>% #hang time
+  ungroup() %>% 
+  dplyr::select(game_str, play_id, endTime, airTime)
+
+AsGameEvents <- AsGameEvents %>% 
+  inner_join(hm) #add hang time 
+  
+#Add year variable to differentiate training/testing values
+AsGameEvents <- AsGameEvents %>% 
+  mutate(year = as.numeric(substr(game_str,1,4)))
+
+AsGameEvents %>% 
+  filter(year != 1903) %>% 
+  ggplot(aes(x = airTime)) + geom_density()
+```
+#Code success and failures
+```{r}
+hm <- AsGameEvents
+hm <- hm %>% 
+  group_by(game_str, play_id) %>% 
+  slice(3) %>% 
+  mutate(success = factor(if_else(event_code == 2,1,0))) %>% #ball acquired first is successful catch
+  ungroup() %>% 
+  dplyr::select(game_str, play_id, success)
+
+AsGameEvents <- AsGameEvents %>% inner_join(hm)
+```
+#Hang time model effects
+```{r}
+AsGameEvents %>% 
+  filter(year != 1903) %>% 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  mutate(airTime = airTime/1000) %>% 
+  ggplot(aes(x = success, 
+             y = airTime, 
+             color = success)) + 
+  geom_boxplot() + 
+  geom_jitter(width = .25) +
+  scale_color_manual(values = c("blue", "red")) +
+  labs(title = "Balls with more hang time are more likely to be caught",
+       y = "Hang Time (seconds)",
+       x = "",) +
+  scale_x_discrete(labels = c("Dropped", "Caught")) +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 18),
+        axis.title.y = element_text(size = 15))
+```
+0-3 seconds: uncatchable
+3-6 seconds: skill comes in to play
+6+ seconds: can of corn
+
+#Get each OF coordinates at the time of the pitch
+```{r}
+finaldf <- AsGameEvents %>% 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  dplyr::select(-at_bat, -player_position, -event_code)
+
+
+# Each OF positions at the pitch
+finaldf <- AsGameEvents %>% 
+  group_by(game_str, play_id) %>% 
+  slice(1) %>% 
+  dplyr::select(game_str, play_id, timestamp) %>% 
+  inner_join(playerPos) %>% 
+  filter(player_position %in% c(7:9)) %>% 
+  full_join(finaldf)
+```
+PROBLEM: Not all plays are included in game info (containing who is on the field)
+```{r}
+OFsByPlay <- AsGameInfo %>% 
+  dplyr::select(game_str, play_per_game, left_field, center_field, right_field)
+
+#plays where play_per_game matches 
+have_player <- inner_join(OFsByPlay, finaldf)
+
+#update. NAs need to be fixed
+finaldf <- full_join(finaldf,have_player)
+
+pbp_errors <- finaldf %>% 
+  filter(is.na(left_field))
+
+
+#51 errors
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 1) %>% 
+  ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+
+have_player <- full_join(have_player,new_players, by = c("game_str", "play_id"))
+
+##Add two to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 2) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add three to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 3) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add four to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 4) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add five to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 5) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add six to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 6) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add seven to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 7) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add eight to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 8) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add ten to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 10) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add eleven to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 11) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##Add 16 to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game + 16) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+##subtract 2 to play_per_game
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+pbp_errors <- pbp_errors %>% 
+  mutate(play_per_game = play_per_game -2) %>% 
+    ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+
+
+#Left with 2 errors from the same game. Fix manually
+pbp_errors <- pbp_errors %>% mutate(play_per_game = 99) %>% 
+  ungroup() %>% 
+  dplyr::select(game_str, play_per_game, play_id)
+
+new_players <- inner_join(OFsByPlay, pbp_errors)
+
+have_player <- full_join(have_player, new_players, by = c("game_str", "play_id"))
+
+pbp_errors <- anti_join(finaldf, have_player, by = c("game_str", "play_id"))
+```
+
+One duplicate play.. De-duplicate that
+```{r}
+have_player %>% group_by(game_str, play_id) %>% count() %>% arrange(desc(n))
+
+duplicatePlay <- have_player %>% filter(game_str == "1903_16_TeamNI_TeamA3", play_id == 75)
+
+have_player <- have_player %>% filter(!(game_str == "1903_16_TeamNI_TeamA3" & play_id == 75)) %>% rbind(duplicatePlay[1:3,])
+```
+
+Add correct outfielders for each play
+```{r}
+CFs <- have_player %>% dplyr::select(game_str, play_id, contains("center")) %>% 
+  mutate(across(contains("center"), ~paste(.), .names = "new_{.col}")) %>% 
+  unite(CF, starts_with("new"), na.rm = T, sep = ",") %>% 
+  dplyr::select(game_str, play_id, CF)
+
+CFs$CF <- gsub('[,NA]','',CFs$CF)
+
+RFs <- have_player %>% dplyr::select(game_str, play_id, contains("right")) %>% 
+  mutate(across(contains("right"), ~paste(.), .names = "new_{.col}")) %>% 
+  unite(RF, starts_with("new"), na.rm = T, sep = ",") %>% 
+  dplyr::select(game_str, play_id, RF)
+
+RFs$RF <- gsub('[,NA]','',RFs$RF)
+
+LFs <- have_player %>% dplyr::select(game_str, play_id, contains("left")) %>% 
+  mutate(across(contains("left"), ~paste(.), .names = "new_{.col}")) %>% 
+  unite(LF, starts_with("new"), na.rm = T, sep = ",") %>% 
+  dplyr::select(game_str, play_id, LF)
+
+LFs$LF <- gsub('[,NA]','',LFs$LF)
+
+finaldf <- cbind(finaldf, LFs)
+finaldf <- cbind(finaldf, CFs)
+finaldf <- cbind(finaldf, RFs)
+```
+#Get ball position at the catch
+```{r}
+finaldf <- finaldf %>% dplyr::select(game_str...1, play_id...2, player_position, field_x, field_y, pitchTime, play_per_game, endTime, airTime, year, success, LF, CF, RF)
+
+finaldf <- finaldf %>% rename(game_str = game_str...1,
+                              play_id = play_id...2)
+
+BallEnds <- AsGameEvents %>% 
+  filter(endTime == timestamp) %>% 
+  inner_join(AsBalls)
+
+#add columns for ball location at catch/drop
+finaldf <- BallEnds %>% dplyr::select(game_str, play_id, ball_position_x, ball_position_y) %>% 
+  inner_join(finaldf)
+```
+#Get distance of OFs at start of play and ball landing/catch spot
+```{r}
+# add distance
+finaldf <- finaldf %>% rename(ball_end_x = ball_position_x,
+                   ball_end_y = ball_position_y,
+                   field_pitch_x = field_x,
+                   field_pitch_y = field_y) %>% 
+  mutate(distance = sqrt((ball_end_x - field_pitch_x)^2 + (ball_end_y - field_pitch_y)^2))
+```
+
+#Remove rows where a different outfielder made the catch
+```{r}
+# for balls caught by a different outfielder, we do not count that as an opportunity. 
+
+catchInfo <- AsGameEvents %>% filter(timestamp==endTime) %>% 
+  filter(success==1) %>% 
+  dplyr::select(game_str, play_id, player_position) %>% 
+  rename(caught = player_position)
+
+finaldf <- full_join(finaldf, catchInfo)
+
+finaldf <- finaldf %>% filter(is.na(caught) |
+  caught == player_position)
+
+finaldf <- finaldf %>% dplyr::select(-caught)
+```
+
+```{r}
+finaldf %>% 
+  filter(year != 1903) %>% 
+  mutate(airTime = airTime / 1000) %>% 
+  ggplot(aes(x = distance, 
+             y = airTime, 
+             color = factor(success))) + 
+  geom_point(alpha = 0.4) +
+  theme_classic() +
+  labs(title="The relationship between hang time and distance is key",
+       x = "Outfielder Distance at pitch to ball landing spot (feet)",
+       y = "Hang Time (seconds)",
+       color = "Caught?") +
+  scale_color_manual(values = c("blue", "red"), labels = c("No", "Yes")) +
+  theme(axis.title.y = element_text(size = 14),
+        axis.title.x = element_text(size = 14))
+```
+#Get ball direction relative to outfielder facing directly towards home
+```{r}
+getOption("scipen")
+options(scipen=999)
+finaldf <- finaldf %>% 
+  mutate(dotP = -1*field_pitch_x*(ball_end_x-field_pitch_x) + -1*field_pitch_y*(ball_end_y-field_pitch_y)) %>% 
+  mutate(magnitudes = sqrt(field_pitch_x^2 + field_pitch_y^2) * sqrt(((ball_end_x-field_pitch_x)^2) + (ball_end_y-field_pitch_y)^2)) %>% 
+  mutate(angle = acos(dotP / magnitudes)*180/pi)
+```
+Set directions to In, Back, or Side
+```{r}
+finaldf <- finaldf %>% 
+  mutate(angle = round(angle, 2)) %>% 
+  mutate(Direction = case_when(angle > 135 ~ "Back",
+                               angle < 45 ~ "In",
+                               TRUE ~ "Side"))
+```
+
+Dummy variable for fielder going back
+```{r}
+finaldf <- finaldf %>% mutate(Back = ifelse(Direction == "Back",1,0) %>% factor())
+```
+
+Cool viz
+```{r}
+library(GeomMLBStadiums)
+finaldf %>% 
+  filter(year != 1903) %>% 
+  ggplot(aes(x = ball_end_x, y = ball_end_y, color = success)) +
+  geom_point()+
+  geom_spraychart(stadium_transform_coords = T, stadium_segments = "all", stadium_ids = "rangers") +
+  theme_minimal() +
+  labs(x = "feet",
+       y = "feet",
+       color = "Caught?",
+       title = "1901-1902 Outfield Opportunity Locations") +
+  scale_color_manual(values = c("blue", "red"), labels = c("No", "Yes")) 
+```
+Set the player to be the correct player (LF, CF, or RF)
+```{r}
+finaldf <- finaldf %>% mutate(player = case_when(player_position == 7 ~ LF,
+                                      player_position == 8 ~ CF,
+                                      TRUE ~ RF) %>% 
+                     factor())
+```
+Assign home teams
+```{r}
+finaldf <- finaldf %>% mutate(teamGame = substr(game_str, 20, 21) %>% 
+                                as.factor())
+```
+
+Make air time in seconds
+```{r}
+finaldf <- finaldf %>% 
+  mutate(airTime = airTime/1000)
+```
+
+Drop unnecessary columns
+```{r}
+modeldf <- finaldf %>% 
+  dplyr::select(-pitchTime, -play_per_game, -endTime, -LF, -CF, -RF, -dotP, -magnitudes)
+```
+
+Write out
+```{r}
+write.csv(modeldf, "UConnModelDF.csv")
+```
+

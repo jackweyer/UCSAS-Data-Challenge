@@ -1,0 +1,531 @@
+---
+title: "uconn_modeling"
+author: "Jack Weyer"
+date: '2022-07-21'
+output: pdf_document
+---
+
+```{r}
+library(tidymodels)
+library(MASS)
+library(ggridges)
+library(discrim)
+library(vip)
+library(ggrepel)
+```
+
+Load in data
+```{r}
+modeldf <- read.csv("UConnModelDF.csv")
+modeldf <- modeldf %>% dplyr::select(-X)
+modeldf <- modeldf %>% 
+  mutate(success = success %>% as.factor(),
+         Back = Back %>% as.factor(),
+         player = player %>% as.factor())
+
+```
+
+Train/Test Split
+```{r}
+training <- modeldf %>% filter(year < 1903)
+testing <- modeldf %>% filter(year == 1903)
+```
+
+##Cross validation
+```{r}
+set.seed(425)
+folds <- vfold_cv(training, v = 10, repeats = 5)
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+```
+
+Every recipe will have airTime and distance with a combination of angle, Back, and/or Direction
+
+##Create recipes
+```{r}
+recAll <- recipe(success ~ airTime + distance + Direction + angle, data = training) %>%
+  step_dummy(all_nominal_predictors())
+
+recAllBack <- recipe(success ~ airTime + distance + Back + angle, data = training) %>% 
+  step_dummy(all_nominal_predictors())
+
+recBack <- recipe(success ~ airTime + distance + Back, data = training) %>% 
+  step_dummy(all_nominal_predictors())
+
+recDir <- recipe(success ~ airTime + distance + Direction, data = training) %>% 
+  step_dummy(all_nominal_predictors())
+
+recAng <- recipe(success ~ airTime + distance + angle, data = training) %>% 
+  step_dummy(all_nominal_predictors())
+
+recNone <- recipe(success ~ airTime + distance, data = training) %>% 
+  step_dummy(all_nominal_predictors())
+```
+
+##Logistic Regression
+```{r}
+lr_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+```
+
+```{r}
+make_model <- function(spec, rec) {
+  wf <- workflow() %>% 
+    add_model(spec) %>% 
+    add_recipe(rec)
+  
+  fitted <- wf %>% 
+    fit_resamples(resamples = folds, control = keep_pred)
+  
+  collect_metrics(fitted)
+}
+
+TotalrecVec <- c("recAll", "recAllBack", "recBack", "recDir", "recAng", "recNone")
+ModelList <- c()
+
+
+run_models <- function(spec, recVec, ModelList) {
+  for (i in recVec) {
+    ModelList[[i]] <- make_model(spec, get(i))
+  }
+  return(ModelList)
+}
+
+LogRegModels <- run_models(lr_spec, TotalrecVec, ModelList)
+LogRegModels
+```
+recBack wins the AUC contest.. (airTime + distance + Back)
+accuracy 0.9725697
+roc_auc	 0.9941544	
+
+##Linear Discriminant Analysis
+```{r}
+lda_spec <- discrim_linear() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+LDAModels <- run_models(lda_spec, TotalrecVec, ModelList)
+LDAModels
+```
+recNone wins the AUC contst.. (airTime + distance)
+accuracy 0.9413377
+roc_auc  0.9848817
+
+##Quadratic Discriminant Analysis
+```{r}
+qda_spec <- discrim_quad() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+QDAModels <- run_models(qda_spec, TotalrecVec, ModelList)
+QDAModels
+```
+recNone wins the AUC contst.. (airTime + distance)
+accuracy 0.9673359
+roc_auc  0.9923346
+
+##Random Forest
+```{r}
+tune_spec <- rand_forest(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune()
+) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+tune_wf <- workflow() %>% 
+  add_recipe(recAll) %>% 
+  add_model(tune_spec)
+
+set.seed(98011)
+tune_res <- tune_grid(
+  tune_wf,
+  resamples = folds,
+  grid = 20
+)
+
+tune_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  dplyr::select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+#mtry 2 to 3
+#min_n 25 to 35
+
+rf_grid <- grid_regular(
+  mtry(range = c(2,3)),
+  min_n(range = c(25,35)),
+  levels=10
+)
+
+set.seed(509)
+regular_res <- tune_grid(
+  tune_wf,
+  resamples = folds,
+  grid = rf_grid
+)
+
+regular_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean, color = min_n)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+
+best_auc <- select_best(regular_res, "roc_auc")
+
+final_rf <- finalize_model(
+  tune_spec,
+  best_auc
+)
+
+tree_prep <- prep(recAll)
+
+final_rf %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(success ~ .,
+    data = juice(tree_prep)
+  ) %>%
+  vip(geom = "point")
+```
+```{r}
+rf_spec <- rand_forest(mtry = 3, min_n = 32) %>% 
+  set_engine("randomForest", importance = T) %>% 
+  set_mode("classification")
+
+rf_wf <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_recipe(recAll)
+
+rf_fit <- rf_wf %>% fit_resamples(resamples = folds, control = keep_pred)
+
+collect_metrics(rf_fit)
+```
+accuracy 0.9697154	
+roc_auc  0.9913012
+
+Will try distance, airtime (recNone)
+```{r}
+tune_wf4 <- workflow() %>% 
+  add_recipe(recNone) %>% 
+  add_model(tune_spec)
+
+set.seed(9)
+tune_res4 <- tune_grid(
+  tune_wf4,
+  resamples = folds,
+  grid = 20
+)
+
+tune_res4 %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  dplyr::select(mean, min_n, mtry) %>%
+  pivot_longer(min_n:mtry,
+    values_to = "value",
+    names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+#mtry 1
+#min_n 34 to 39
+
+rf_grid4 <- grid_regular(
+  min_n(range = c(34,39)),
+  levels=6
+)
+
+tune_spec2 <- rand_forest(
+  mtry = 1,
+  trees = 1000,
+  min_n = tune()
+) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger")
+
+tune_wf4 <- workflow() %>% 
+  add_recipe(recNone) %>% 
+  add_model(tune_spec2)
+
+set.seed(1)
+regular_res4 <- tune_grid(
+  tune_wf4,
+  resamples = folds,
+  grid = rf_grid4
+)
+
+regular_res4 %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(min_n = factor(min_n)) %>%
+  ggplot(aes(mtry, mean)) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "AUC")
+#mtry 1, min_n 38
+
+best_auc4 <- select_best(regular_res4, "roc_auc")
+
+final_rf4 <- finalize_model(
+  tune_spec2,
+  best_auc4
+)
+
+tree_prep4 <- prep(recNone)
+
+final_rf4 %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(success ~ .,
+    data = juice(tree_prep4)
+  ) %>%
+  vip(geom = "point")
+```
+
+```{r}
+rf_spec4 <- rand_forest(mtry = 1, min_n = 38) %>% 
+  set_engine("randomForest", importance = T) %>% 
+  set_mode("classification")
+
+rf_wf4 <- workflow() %>% 
+  add_model(rf_spec4) %>% 
+  add_recipe(recNone)
+
+rf_fit4 <- rf_wf4 %>% fit_resamples(resamples = folds, control = keep_pred)
+
+RFmetrics <- collect_metrics(rf_fit4)
+```
+accuracy	0.9691202	50	0.0018111042	Preprocessor1_Model1
+roc_auc	 0.9921972 .. best RF model
+
+
+#Putting it all together
+```{r}
+modelviz <- data.frame(models = c("Log Reg", "LDA", "QDA", "RF"),
+                       ROC_AUC = c(LogRegModels$recBack[["mean"]][2],
+LDAModels$recNone[["mean"]][2], QDAModels$recNone[["mean"]][2],
+RFmetrics$mean[2]))
+```
+
+```{r}
+final_Model <- lr_spec %>% 
+  fit(success ~ airTime + distance + Back, data = training)
+
+augment(final_Model, testing) %>% conf_mat(truth = success, estimate = .pred_class)
+
+augment(final_Model, testing) %>% conf_mat(truth = success, estimate = .pred_class) %>% autoplot()
+```
+97% accuracy on testing data!!!
+```{r}
+preds <- augment(final_Model, testing)
+
+tidy(final_Model)
+```
+```{r}
+preds <- preds %>% mutate(success = as.integer(success)-1)
+preds <- preds %>% mutate(OAA = success - .pred_1)
+OAAmetric <- preds %>% group_by(player) %>% 
+  summarise(tot_OAA = sum(OAA),
+            n = n()) %>% 
+  arrange(desc(tot_OAA))
+
+OAAmetric
+```
+Get Team A outfielders
+```{r}
+gameInfo <- read.csv("game_info.csv")
+Agames <- gameInfo %>% filter(substr(game_str, 20,20) == 'A') %>% 
+  filter(substr(game_str, 1, 4) == '1903')
+
+Aplayers <- Agames %>% filter(top_bottom_inning == "Top") %>% pull(left_field) %>% unique()
+
+Aplayers2 <- Agames %>% filter(top_bottom_inning == "Top") %>% pull(center_field) %>% unique()
+
+Aplayers3 <- Agames %>% filter(top_bottom_inning == "Top") %>% pull(right_field) %>% unique()
+
+Aplayers <- append(Aplayers, Aplayers2)
+Aplayers <- append(Aplayers, Aplayers3) %>% unique()
+```
+
+Check if any Team A outfielders played against Team A
+```{r}
+Nonplayers <- Agames %>% filter(top_bottom_inning == "Bottom") %>% pull(left_field) %>% unique()
+
+Nonplayers2 <- Agames %>% filter(top_bottom_inning == "Bottom") %>% pull(center_field) %>% unique()
+
+Nonplayers3 <- Agames %>% filter(top_bottom_inning == "Bottom") %>% pull(right_field) %>% unique()
+
+Nonplayers <- append(Nonplayers, Nonplayers2)
+Nonplayers <- append(Nonplayers, Nonplayers3) %>% unique()
+
+Nonplayers %in% Aplayers
+```
+Good. Can now assign teams confidently
+```{r}
+preds <- preds %>% mutate(Organization = ifelse(player %in% Aplayers, "A","Opponents"))
+```
+
+```{r}
+byPlayer <- preds %>% group_by(player, Organization) %>% 
+  summarise(tot_OAA = round(sum(OAA),1),
+            n = n(),
+            xOuts = sum(.pred_1),
+            trueOuts = sum(success),
+            OAAperOpportunity = round((tot_OAA/n),3)) %>% 
+  arrange(desc(tot_OAA))
+
+byPlayer %>% 
+  ggplot(aes(x = xOuts, y = trueOuts, color = Organization)) + geom_point(size = 4, alpha = .7) +
+  scale_color_manual(values = c("#003831", "purple")) +
+  geom_label_repel(aes(
+                label = ifelse(tot_OAA >= 1.5, as.character(player), "")),
+                box.padding = 1.1,
+                point.padding = 0.1,
+                segment.color = "grey50") +
+  geom_abline(color = "black") +
+  theme_minimal() +
+  labs(x = "Expected Outs (based on catch probabilities)",
+       y = "Actual Outs",
+       title = "1903 Outfielders by Organization",
+       subtitle = "Line denotes average Outfielder. Above line = Above average") +
+  theme(legend.position = c(.85,.3),
+        legend.background = element_rect(fill = "white", color = "black"),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 16))
+```
+```{r}
+preds %>% 
+  ggplot(aes(x = distance, y = airTime, color = .pred_1)) +
+  geom_point() +
+  scale_color_gradient2(midpoint = .5, high = "red", low = "blue", mid = "green") +
+  theme_classic() +
+  scale_x_continuous(n.breaks = 8) +
+  scale_y_continuous(n.breaks = 7) +
+  theme(axis.title.y = element_text(size=15),
+        axis.title.x = element_text(size=13)) +
+  labs(x = "Outfielder Distance at pitch to ball landing spot (feet)",
+       y = "Hang Time (seconds)",
+       color = "Catch\nProbability",
+       title = "Predicted Outcomes on 1903 Data")
+```
+```{r}
+preds %>% 
+  mutate(Correct = ifelse(success == as.numeric(.pred_class)-1,1,0)) %>% 
+  ggplot(aes(x = distance, y = airTime, color = as.factor(Correct))) +
+  geom_point(alpha = 0.5) +
+  theme_classic() +
+  scale_x_continuous(n.breaks = 8) +
+  scale_y_continuous(n.breaks = 7) +
+  theme(axis.title.y = element_text(size=15),
+        axis.title.x = element_text(size=13)) +
+  labs(x = "Outfielder Distance at pitch to ball landing spot (feet)",
+       y = "Hang Time (seconds)",
+       color = "Predicted\ncorrectly?",
+       title = "Predicted Outcomes on 1903 Data") +
+  scale_color_manual(values = c("red", "gray"), labels = c("No", "Yes"))
+```
+```{r}
+OAAmetric <- preds %>% group_by(player, Organization) %>% 
+  summarise(`Season OAA` = round(sum(OAA),2),
+            Opportunities = n()) %>% 
+  arrange(desc(`Season OAA`))
+
+OAAmetric
+```
+
+A or opponents better?
+```{r}
+preds %>% group_by(Organization) %>% 
+summarise(tot_OAA = round(sum(OAA),1),
+            n = n(),
+            xOuts = sum(.pred_1),
+            trueOuts = sum(success),
+            OAAperOpportunity = round((tot_OAA/n),3)) %>% 
+  arrange(desc(tot_OAA))
+```
+
+A by level
+```{r}
+Ateams <- preds %>% filter(Organization == "A") %>% 
+  group_by(teamGame) %>% 
+  summarise(tot_OAA = round(sum(OAA),1),
+            n = n(),
+            xOuts = sum(.pred_1),
+            trueOuts = sum(success),
+            OAAperOpportunity = round((tot_OAA/n),3)) %>% 
+  arrange(desc(tot_OAA))
+
+Ateams %>% ggplot(aes(x = teamGame, y = OAAperOpportunity)) + geom_bar(stat = "identity")
+```
+3 distinct levels
+
+```{r}
+TeamOpps <- preds %>%
+  group_by(teamGame, Organization) %>% 
+  summarise(tot_OAA = round(sum(OAA),1),
+            n = n(),
+            xOuts = sum(.pred_1),
+            trueOuts = sum(success),
+            OAAperOpportunity = round((tot_OAA/n),3)) %>% 
+  arrange(desc(tot_OAA))
+
+TeamOpps <- TeamOpps %>% mutate(trueTeam = paste(teamGame,Organization),
+                                teamGame = paste(teamGame," Games"))
+
+
+
+TeamOpps %>% 
+  ggplot(aes(x = Organization, y = OAAperOpportunity, fill = Organization)) + geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("#003831", "purple")) +
+  facet_wrap(~teamGame) +
+  theme_minimal() +
+  geom_hline(yintercept = 0, color = "red", size = 2) +
+  labs(x = "",
+       y = "OAA per Opportunity",
+       title = "Organization A's Outfield Fly Ball Skill is topheavy",
+       subtitle = "1903 season") +
+  theme(legend.position = "none",
+        axis.title.y = element_text(size = 17),
+        strip.text.x = element_text(size = 14),
+        axis.text.x = element_text(size = 12))
+```
+
+A1 > Opponents (+.046)
+A2 < Opponents (-.009)
+A3 < Opponents (-.011)
+
+```{r}
+TeamOpps %>% 
+  group_by(Organization) %>% 
+  summarise(Outs = sum(trueOuts),
+            xOuts = sum(xOuts),
+            OAA = Outs - xOuts,
+            Opps = sum(n),
+            OAApO = OAA/Opps)
+```
+
+Most improbable catch
+```{r}
+preds %>% filter(success==1) %>% filter(player == 2737) %>% 
+  arrange(.pred_1)
+```
+Worst misses
+```{r}
+preds %>% filter(success==0) %>% arrange(desc(.pred_1))
+```
+Write results
+```{r}
+write.csv(byPlayer, "UConnResults.csv")
+```
+
